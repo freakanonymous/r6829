@@ -10,3 +10,5 @@
     NtQueryDirectoryFile
     
   also has anti regedit, event viewer, and anti winpcap dlls
+
+  contains mild amount of antiskid.
