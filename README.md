@@ -9,6 +9,6 @@
     NtQuerySystemInformation
     NtQueryDirectoryFile
     
-  also has anti regedit, event viewer, and anti winpcap dlls
+  also has anti regedit, event viewer, and anti winpcap/npcap dlls, if any dll called "packet.dll" or "wpcap.dll" is loaded into any process under hook, it will call exit(0); to kill it.
 
   contains mild amount of antiskid.
