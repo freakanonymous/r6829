@@ -15,9 +15,6 @@
     <ClCompile Include="..\r77-src\main.cpp">
       <Filter>r77-src</Filter>
     </ClCompile>
-    <ClCompile Include="..\r77-src\Rootkit.cpp">
-      <Filter>r77-src</Filter>
-    </ClCompile>
     <ClCompile Include="..\r77-src\MinHook\HDE\hde32.c">
       <Filter>r77-src\MinHook\HDE</Filter>
     </ClCompile>
@@ -60,9 +57,6 @@
       <Filter>r77-src</Filter>
     </ClInclude>
     <ClInclude Include="..\r77-src\r77.h">
-      <Filter>r77-src</Filter>
-    </ClInclude>
-    <ClInclude Include="..\r77-src\Rootkit.h">
       <Filter>r77-src</Filter>
     </ClInclude>
     <ClInclude Include="..\r77-src\MinHook\HDE\hde32.h">

